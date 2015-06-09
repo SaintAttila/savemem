@@ -24,7 +24,7 @@ setup(
     version=__version__,
     description='savemem - Disk-backed non-persistent containers for memory efficiency',
     long_description=long_description,
-    # url='???',
+    url='https://github.com/SaintAttila/savemem',
     author=__author__,
     author_email='hosford42@gmail.com',
     license='MIT',
