@@ -64,13 +64,21 @@ class LowMemContainer:
 
         self._cache_limit = self._default_cache_limit
         self._cache = dict(*args, **kwargs)
+
+        self._length = len(self._cache)
+
+        # TODO: Right now this is kept updated but not actually used.
+        #       Ideally we should use it to flush smaller chunks more frequently.
+        #       This should help balance the processor vs. disk load.
         self._recency = {}
 
         self._flush_thread = None
         self._stop_flushing = False
         self._flush_exception = None
+        self._has_flushed = False
 
-        self.flush()
+        if len(self._cache) >= self._cache_limit:
+            self._partial_flush()
 
     def __del__(self):
         self.close()
@@ -146,12 +154,53 @@ class LowMemContainer:
         except BaseException as exception:
             self._flush_exception = exception
 
+    # TODO: Compare performance of using flush, _partial_flush, and _flush_one in _get and _set
+    def _flush_one(self):
+        if not self._cache:
+            return  # Nothing to do
+
+        if self._has_flushed:
+            self._wait_for_flush()
+        else:
+            self._has_flushed = True
+
+        key = min(self._recency, key=self._recency.get)
+        value = self._cache.pop(key)
+        del self._recency[key]
+
+        self._flush_thread = threading.Thread(target=self._do_flush, args=({key: value},))
+        self._flush_thread.daemon = True
+        self._flush_thread.start()
+
+    def _partial_flush(self):
+        if not self._cache:
+            return  # Nothing to do
+
+        if self._has_flushed:
+            self._wait_for_flush()
+
+        to_flush = {}
+        for _ in range(len(self._cache) - (self._cache_limit // 4)):
+            key = min(self._recency, key=self._recency.get)
+            value = self._cache.pop(key)
+            to_flush[key] = value
+            del self._recency[key]
+
+        if to_flush:
+            self._has_flushed = True
+            self._flush_thread = threading.Thread(target=self._do_flush, args=(to_flush,))
+            self._flush_thread.daemon = True
+            self._flush_thread.start()
+
     def flush(self, synchronous=False, exclusions=None):
         """Completely remove all cached items from RAM and dump them to disk."""
         if not self._cache:
             return  # Nothing to do
 
-        self._wait_for_flush()
+        if self._has_flushed:
+            self._wait_for_flush()
+        else:
+            self._has_flushed = True
 
         cache = self._cache
 
@@ -161,6 +210,7 @@ class LowMemContainer:
             for key in exclusions:
                 self._cache[key] = cache.pop(key)
                 self._recency[key] = recency.pop(key)
+            recency.clear()
             del recency
         else:
             self._cache = {}
@@ -175,73 +225,95 @@ class LowMemContainer:
             self._wait_for_flush()
 
     def _get(self, key):
-        if key in self._cache:
+        if self._has_flushed and key not in self._cache:
+            self._wait_for_flush()
+
+            try:
+                value = self._shelf[self._encode_key(key)]
+            except KeyError:
+                raise KeyError(key)
+
+            if len(self._cache) >= self._cache_limit:
+                self._partial_flush()
+
+            self._cache[key] = value
             self._recency[key] = time.time()
-            return self._cache[key]
 
-        self._wait_for_flush()
-
-        try:
-            value = self._shelf[self._encode_key(key)]
-        except KeyError:
-            raise KeyError(key)
-
-        if len(self._cache) >= self._cache_limit:
-            self.flush()
-
-        self._cache[key] = value
-        self._recency[key] = time.time()
-
-        return value
+            return value
+        else:
+            value = self._cache[key]
+            self._recency[key] = time.time()
+            return value
 
     def _set(self, key, value):
         if key in self._cache:
             self._cache[key] = value
+            self._recency[key] = time.time()
             return
 
         if len(self._cache) >= self._cache_limit:
-            self.flush()
+            self._partial_flush()
 
         self._cache[key] = value
         self._recency[key] = time.time()
+        self._length += 1
 
     def _del(self, key):
-        if key in self._cache:
+        if self._has_flushed:
+            if key in self._cache:
+                del self._cache[key]
+                del self._recency[key]
+                found = True
+            else:
+                found = False
+
+            self._wait_for_flush()
+
+            try:
+                del self._shelf[self._encode_key(key)]
+            except KeyError:
+                if not found:
+                    raise KeyError(key)
+
+            if not self._shelf:
+                self._has_flushed = False
+        else:
             del self._cache[key]
-            del self._recency[key]
 
-        self._wait_for_flush()
-
-        try:
-            del self._shelf[self._encode_key(key)]
-        except KeyError:
-            pass
+        self._length -= 1
 
     def __contains__(self, key):
         if key in self._cache:
             self._recency[key] = time.time()
             return True
 
-        if key in self._recency:
-            return True
-
-        self._wait_for_flush()
-        return self._encode_key(key) in self._shelf
+        if self._has_flushed:
+            self._wait_for_flush()
+            return self._encode_key(key) in self._shelf
+        else:
+            return False
 
     def __iter__(self):
-        self._wait_for_flush()
-        for key_str in self._shelf:
-            yield self._decode_key(key_str)
+        if self._has_flushed:
+            self._wait_for_flush()
+            return (self._decode_key(key_str) for key_str in self._shelf)
+        else:
+            return iter(self._cache)
 
     def __len__(self):
-        return len(self._shelf)
+        return self._length
 
     def clear(self):
         """Remove all items."""
-        self._wait_for_flush(interrupt=True)
         self._cache.clear()
         self._recency.clear()
-        self._shelf.clear()
+
+        if self._has_flushed:
+            self._wait_for_flush(interrupt=True)
+            self._shelf.clear()
+            self._has_flushed = False
+
+        self._length = 0
 
 
 class LowMemSet(LowMemContainer, MutableSet):
@@ -360,3 +432,8 @@ class LowMemDict(LowMemContainer, MutableMapping):
     __setitem__ = LowMemContainer._set
     __delitem__ = LowMemContainer._del
 
+    def get(self, key, default=None):
+        try:
+            return self._get(key)
+        except KeyError:
+            return default
