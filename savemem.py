@@ -77,17 +77,28 @@ class LowMemContainer:
         self._flush_exception = None
         self._has_flushed = False
 
-        if len(self._cache) >= self._cache_limit:
+        if len(self._cache) > self._cache_limit:
             self._partial_flush()
 
     def __del__(self):
         self.close()
 
-    @property
-    def cache_limit(self):
-        """The cache limit for this container. This is the maximum number of items (values or key/value pairs)
-        that this container will hold in memory."""
+    def _get_cache_limit(self):
         return self._cache_limit
+
+    def _set_cache_limit(self, limit):
+        assert isinstance(limit, int)
+        assert limit >= 0
+        self._cache_limit = limit
+        if len(self._cache) > self._cache_limit:
+            self._partial_flush()
+
+    cache_limit = property(
+        _get_cache_limit,
+        _set_cache_limit,
+        doc="The cache limit for this container. This is the maximum number of items (values or key/value pairs) "
+            "that this container will hold in memory."
+    )
 
     @property
     def cache_size(self):
@@ -374,12 +385,12 @@ class LowMemList(LowMemContainer, MutableSequence):
     threshold is 10000 bytes.
     """
 
-    def _convert_index(self, index):
+    def _convert_index(self, index, append=False):
         assert isinstance(index, int)
         length = len(self)
         if index < 0:
             index += length
-        if 0 <= index < length:
+        if 0 <= index < length + append:
             return index
         else:
             raise IndexError(index)
@@ -406,7 +417,7 @@ class LowMemList(LowMemContainer, MutableSequence):
             raise NotImplementedError("Deletion is not supported except at the end of a list.")
 
     def insert(self, index, value):
-        index = self._convert_index(index)
+        index = self._convert_index(index, True)
         if index == len(self):
             self._set(index, value)
         else:
